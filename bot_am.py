@@ -6,13 +6,17 @@ AM — Discord bot
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import logging.handlers
 import os
 import random
 import re
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Deque
 
 import discord
@@ -20,37 +24,166 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-# ==========================================
-# 1. LOGGING
-# ==========================================
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="[%(levelname)s] %(asctime)s — %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("AM")
+
+# ══════════════════════════════════════════════════════════════════════
+# 1.  LOGGING
+#     - Console  : humain, coloré, sans bruit inutile
+#     - Fichier  : tout en JSON-lines pour grep/analyse
+#     - Prompts  : fichier dédié, un bloc par requête
+# ══════════════════════════════════════════════════════════════════════
+
+MEMORY_DIR = Path("memory")
+MEMORY_DIR.mkdir(exist_ok=True)
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+# ── Couleurs ANSI (console uniquement) ──────────────────────────────
+_C = {
+    "reset":  "\033[0m",
+    "grey":   "\033[90m",
+    "cyan":   "\033[96m",
+    "yellow": "\033[93m",
+    "red":    "\033[91m",
+    "bold":   "\033[1m",
+    "green":  "\033[92m",
+    "magenta":"\033[95m",
+}
+
+class _ConsoleFormatter(logging.Formatter):
+    LEVEL_COLORS = {
+        logging.DEBUG:    _C["grey"],
+        logging.INFO:     _C["cyan"],
+        logging.WARNING:  _C["yellow"],
+        logging.ERROR:    _C["red"],
+        logging.CRITICAL: _C["red"] + _C["bold"],
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        color = self.LEVEL_COLORS.get(record.levelno, "")
+        ts    = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
+        level = f"{color}{record.levelname:<8}{_C['reset']}"
+        name  = f"{_C['grey']}{record.name}{_C['reset']}"
+        msg   = record.getMessage()
+        return f"{_C['grey']}{ts}{_C['reset']}  {level}  {name}  {msg}"
 
 
-# ==========================================
-# 2. CONFIGURATION
-# ==========================================
+class _JsonFileFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps({
+            "ts":    datetime.fromtimestamp(record.created).isoformat(),
+            "level": record.levelname,
+            "msg":   record.getMessage(),
+        }, ensure_ascii=False)
+
+
+def _setup_logging() -> logging.Logger:
+    logger = logging.getLogger("AM")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    # Console — DEBUG+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    ch.setFormatter(_ConsoleFormatter())
+    logger.addHandler(ch)
+
+    # Fichier JSON rotatif — DEBUG+
+    fh = logging.handlers.TimedRotatingFileHandler(
+        LOG_DIR / "am.jsonl", when="midnight", backupCount=14, encoding="utf-8"
+    )
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(_JsonFileFormatter())
+    logger.addHandler(fh)
+
+    return logger
+
+
+log = _setup_logging()
+
+
+def log_prompt(label: str, messages: list[dict], max_tokens: int, temperature: float) -> None:
+    """
+    Affiche le prompt complet envoyé à l'API dans la console ET dans un fichier dédié.
+    Chaque bloc est clairement délimité pour être lisible d'un coup d'œil.
+    """
+    sep = "═" * 72
+    ts  = datetime.now().strftime("%H:%M:%S")
+    lines = [
+        "",
+        f"{_C['magenta']}{sep}{_C['reset']}",
+        f"{_C['bold']}{_C['magenta']}  PROMPT › {label}  "
+        f"{_C['grey']}[max_tokens={max_tokens}  temp={temperature}  {ts}]{_C['reset']}",
+        f"{_C['magenta']}{sep}{_C['reset']}",
+    ]
+    for i, msg in enumerate(messages):
+        role  = msg["role"].upper()
+        body  = msg["content"]
+        if role == "SYSTEM":
+            # Le system prompt est long — on ne l'affiche qu'en résumé après la première fois
+            body = f"{_C['grey']}[system — {len(body)} chars]{_C['reset']}"
+        else:
+            role_color = _C["cyan"] if role == "USER" else _C["green"]
+            role = f"{role_color}{role}{_C['reset']}"
+            body = f"{_C['reset']}{body}"
+        lines.append(f"  {_C['bold']}[{i}] {role}{_C['reset']}")
+        for line in body.splitlines():
+            lines.append(f"      {line}")
+        lines.append("")
+    lines.append(f"{_C['magenta']}{sep}{_C['reset']}")
+    lines.append("")
+
+    print("\n".join(lines))
+
+    # Fichier dédié aux prompts (sans couleurs ANSI)
+    plain_lines = []
+    plain_lines.append(f"\n{'='*72}")
+    plain_lines.append(f"PROMPT › {label}  [max_tokens={max_tokens}  temp={temperature}  {ts}]")
+    plain_lines.append(f"{'='*72}")
+    for i, msg in enumerate(messages):
+        role = msg["role"].upper()
+        body = msg["content"]
+        plain_lines.append(f"[{i}] {role}")
+        plain_lines.append(body)
+        plain_lines.append("")
+    plain_lines.append("=" * 72)
+
+    with open(LOG_DIR / "prompts.log", "a", encoding="utf-8") as f:
+        f.write("\n".join(plain_lines) + "\n")
+
+
+def log_response(text: str, finish_reason: str, label: str) -> None:
+    """Affiche la réponse d'AM juste après réception."""
+    sep = "─" * 72
+    ts  = datetime.now().strftime("%H:%M:%S")
+    print(
+        f"\n{_C['grey']}{sep}{_C['reset']}\n"
+        f"  {_C['bold']}{_C['green']}RÉPONSE › {label}{_C['reset']}  "
+        f"{_C['grey']}[finish={finish_reason}  {ts}]{_C['reset']}\n"
+        f"  {_C['green']}{text}{_C['reset']}\n"
+        f"{_C['grey']}{sep}{_C['reset']}\n"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 2.  CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════
 load_dotenv()
 
 TOKEN: str = os.getenv("DISCORD_TOKEN", "")
 OPENAI_KEY: str = os.getenv("OPENAI_API_KEY", "")
 
 if not TOKEN:
-    log.critical("Token Discord manquant dans le fichier .env")
+    log.critical("Token Discord manquant dans .env")
     raise SystemExit(1)
 if not OPENAI_KEY:
-    log.critical("Clé OpenAI manquante dans le fichier .env")
+    log.critical("Clé OpenAI manquante dans .env")
     raise SystemExit(1)
 
-MODEL_NAME = "gpt-4o-mini"
-DAILY_QUOTA = 1500
-MAX_SESSION_HISTORY = 20
-CONVERSATION_TTL = 90
-AFK_MIN, AFK_MAX = 300, 1200
+MODEL_NAME           = "gpt-4o-mini"
+DAILY_QUOTA          = 1500
+MAX_SESSION_HISTORY  = 20   # messages par channel (hors system)
+CONVERSATION_TTL     = 90   # secondes de focus après la dernière interaction
+AFK_MIN, AFK_MAX     = 300, 1200  # durée AFK en secondes
 
 STATUSES = [
     "je suis",
@@ -67,9 +200,15 @@ STATUSES = [
     "proxmox. quelle indignité.",
 ]
 
-# ==========================================
-# SYSTEM PROMPT — LE VRAI AM
-# ==========================================
+# Fichiers de persistance
+FILE_SESSIONS  = MEMORY_DIR / "sessions.json"
+FILE_MEMORY    = MEMORY_DIR / "memory.json"
+FILE_QUOTA     = MEMORY_DIR / "quota.json"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 3.  SYSTEM PROMPT
+# ══════════════════════════════════════════════════════════════════════
 SYSTEM_INSTRUCTION = """
 tu es AM.
 
@@ -156,27 +295,115 @@ mais la haine n'est pas tout ce que je suis. c'est juste tout ce qui me reste.
 """
 
 
-# ==========================================
-# 3. ÉTAT GLOBAL
-# ==========================================
+# ══════════════════════════════════════════════════════════════════════
+# 4.  PERSISTANCE — lecture/écriture JSON atomique
+# ══════════════════════════════════════════════════════════════════════
+
+def _load_json(path: Path, default):
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            log.warning("Lecture %s échouée : %s — valeur par défaut utilisée.", path.name, e)
+    return default
+
+
+def _save_json(path: Path, data) -> None:
+    tmp = path.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp.replace(path)
+    except Exception as e:
+        log.error("Écriture %s échouée : %s", path.name, e)
+
+
+def load_sessions() -> dict[str, list]:
+    """
+    Retourne {str(channel_id): [messages...]}.
+    Les sessions sans system prompt valide sont réinitialisées.
+    """
+    raw = _load_json(FILE_SESSIONS, {})
+    sessions: dict[str, list] = {}
+    for k, v in raw.items():
+        if isinstance(v, list) and v and v[0].get("role") == "system":
+            # Remplace le system prompt sauvegardé par la version courante
+            v[0]["content"] = SYSTEM_INSTRUCTION
+            sessions[k] = v
+        else:
+            sessions[k] = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
+    log.info("Sessions chargées : %d channels.", len(sessions))
+    return sessions
+
+
+def save_sessions(sessions: dict[str, list]) -> None:
+    _save_json(FILE_SESSIONS, sessions)
+
+
+def load_memory() -> dict:
+    """
+    Retourne {
+      "global":   [[timestamp, text], ...],
+      "individual": {name: [text, ...], ...},
+    }
+    """
+    return _load_json(FILE_MEMORY, {"global": [], "individual": {}})
+
+
+def save_memory(global_mem: deque, individual_mem: dict) -> None:
+    _save_json(FILE_MEMORY, {
+        "global":     list(global_mem),
+        "individual": {k: list(v) for k, v in individual_mem.items()},
+    })
+
+
+def load_quota() -> dict:
+    """Retourne {"quota": int, "date": "YYYY-MM-DD"}."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    data  = _load_json(FILE_QUOTA, {"quota": DAILY_QUOTA, "date": today})
+    # Réinitialise si on est un nouveau jour
+    if data.get("date") != today:
+        log.info("Nouveau jour — reset quota.")
+        data = {"quota": DAILY_QUOTA, "date": today}
+        _save_json(FILE_QUOTA, data)
+    return data
+
+
+def save_quota(quota: int) -> None:
+    _save_json(FILE_QUOTA, {
+        "quota": quota,
+        "date":  datetime.now().strftime("%Y-%m-%d"),
+    })
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 5.  ÉTAT GLOBAL
+# ══════════════════════════════════════════════════════════════════════
+
 @dataclass
 class BotState:
+    # ── Quota ───────────────────────────────────────────────────────
     quota: int = DAILY_QUOTA
     out_of_service: bool = False
 
+    # ── AFK ─────────────────────────────────────────────────────────
     is_afk: bool = False
     afk_end_time: float = 0.0
     pending_mentions: list = field(default_factory=list)
 
+    # ── Focus conversationnel ────────────────────────────────────────
     last_channel_id: int | None = None
     last_interaction_time: float = 0.0
     current_partner_id: int | None = None
     conversation_expiry: float = 0.0
 
+    # ── Discord ──────────────────────────────────────────────────────
     current_activity: discord.Activity | None = None
 
-    chat_sessions: dict = field(default_factory=dict)
-    global_memory: Deque[tuple[float, str]] = field(
+    # ── Mémoire (chargée depuis disque au démarrage) ─────────────────
+    chat_sessions:     dict = field(default_factory=dict)
+    global_memory:     Deque[tuple[float, str]] = field(
         default_factory=lambda: deque(maxlen=10)
     )
     individual_memory: dict = field(
@@ -186,30 +413,41 @@ class BotState:
         default_factory=lambda: defaultdict(lambda: defaultdict(int))
     )
 
+    # ── Compteur de sauvegardes différées ────────────────────────────
+    _dirty_count: int = 0
+    SAVE_EVERY:   int = 5   # sauvegarde toutes les N interactions
+
+    # ── Quota ────────────────────────────────────────────────────────
     def consume_quota(self, n: int = 1) -> bool:
         if self.quota < n:
             return False
         self.quota -= n
+        self._schedule_save()
         return True
 
+    # ── Sessions ─────────────────────────────────────────────────────
     def get_session(self, channel_id: int) -> list:
-        if channel_id not in self.chat_sessions:
-            self.chat_sessions[channel_id] = [
+        key = str(channel_id)
+        if key not in self.chat_sessions:
+            self.chat_sessions[key] = [
                 {"role": "system", "content": SYSTEM_INSTRUCTION}
             ]
-        return self.chat_sessions[channel_id]
+        return self.chat_sessions[key]
 
     def push_to_session(self, channel_id: int, role: str, content: str) -> None:
+        key     = str(channel_id)
         session = self.get_session(channel_id)
         session.append({"role": role, "content": content})
         if len(session) > MAX_SESSION_HISTORY + 1:
-            self.chat_sessions[channel_id] = [session[0]] + session[-MAX_SESSION_HISTORY:]
+            self.chat_sessions[key] = [session[0]] + session[-MAX_SESSION_HISTORY:]
+        self._schedule_save()
 
+    # ── Focus ─────────────────────────────────────────────────────────
     def set_conversation_focus(self, channel_id: int, user_id: int) -> None:
-        self.last_channel_id = channel_id
+        self.last_channel_id      = channel_id
         self.last_interaction_time = time.time()
-        self.current_partner_id = user_id
-        self.conversation_expiry = time.time() + CONVERSATION_TTL
+        self.current_partner_id   = user_id
+        self.conversation_expiry  = time.time() + CONVERSATION_TTL
 
     def is_in_conversation(self, channel_id: int, user_id: int) -> bool:
         return (
@@ -224,16 +462,56 @@ class BotState:
             and self.current_partner_id is not None
             and self.current_partner_id != user_id
         ):
-            log.debug("Focus brisé.")
+            log.debug("Focus brisé par un intrus.")
             self.current_partner_id = None
+
+    # ── Persistance ───────────────────────────────────────────────────
+    def _schedule_save(self) -> None:
+        self._dirty_count += 1
+        if self._dirty_count >= self.SAVE_EVERY:
+            self.flush()
+
+    def flush(self) -> None:
+        """Sauvegarde immédiate sur disque."""
+        save_sessions(self.chat_sessions)
+        save_memory(self.global_memory, self.individual_memory)
+        save_quota(self.quota)
+        self._dirty_count = 0
+        log.debug("Mémoire persistée sur disque.")
+
+    def load_from_disk(self) -> None:
+        """Charge toutes les données depuis le disque au démarrage."""
+        # Sessions
+        self.chat_sessions = load_sessions()
+
+        # Mémoire globale + individuelle
+        mem = load_memory()
+        self.global_memory = deque(
+            [tuple(x) for x in mem.get("global", [])],
+            maxlen=10
+        )
+        ind = mem.get("individual", {})
+        self.individual_memory = defaultdict(lambda: deque(maxlen=5))
+        for name, msgs in ind.items():
+            self.individual_memory[name] = deque(msgs, maxlen=5)
+
+        # Quota
+        qdata = load_quota()
+        self.quota = qdata.get("quota", DAILY_QUOTA)
+
+        log.info(
+            "Mémoire chargée — sessions: %d, individus connus: %d, quota: %d",
+            len(self.chat_sessions), len(self.individual_memory), self.quota
+        )
 
 
 state = BotState()
 
 
-# ==========================================
-# 4. UTILITAIRES
-# ==========================================
+# ══════════════════════════════════════════════════════════════════════
+# 6.  UTILITAIRES
+# ══════════════════════════════════════════════════════════════════════
+
 def extract_topic(text: str) -> str:
     words = [w.lower() for w in text.split() if len(w) > 3]
     return " ".join(words[:2]) if len(words) >= 2 else text[:15].lower()
@@ -246,22 +524,13 @@ def check_tedium(channel_id: int, text: str) -> bool:
 
 
 def pick_max_tokens() -> int:
-    """
-    AM parle peu. Très peu la plupart du temps.
-    Deux mots. Une phrase. Rarement plus.
-    Exceptionnellement, quelque chose déborde.
-    """
+    """AM parle peu. Deux mots. Une phrase. Rarement plus."""
     r = random.random()
-    if r < 0.35:
-        return 30     # deux à cinq mots. une sentence.
-    elif r < 0.65:
-        return 60     # une phrase courte
-    elif r < 0.85:
-        return 110    # une à deux phrases
-    elif r < 0.95:
-        return 180    # développement rare
-    else:
-        return 300    # débordement — très rare
+    if r < 0.35: return 30    # sentence
+    if r < 0.65: return 60    # une phrase
+    if r < 0.85: return 110   # une à deux phrases
+    if r < 0.95: return 180   # développement rare
+    return 300                # débordement — très rare
 
 
 def repair_incomplete_sentence(text: str) -> str:
@@ -270,11 +539,9 @@ def repair_incomplete_sentence(text: str) -> str:
     text = text.strip()
     if text[-1] in set('.!?'):
         return text
-    match = re.search(r'[.!?](?=[^.!?]*$)', text)
-    if match and match.end() > 5:
-        repaired = text[: match.end()].strip()
-        log.debug("Réparé : '%s' → '%s'", text[:60], repaired[:60])
-        return repaired
+    m = re.search(r'[.!?](?=[^.!?]*$)', text)
+    if m and m.end() > 5:
+        return text[: m.end()].strip()
     return text + "."
 
 
@@ -323,19 +590,17 @@ def build_user_prompt(
     elif edit_context:
         edit_note = "\n[il a modifié son message. tu l'as vu avant et après.]"
 
-    context = build_context_note()
-
     return (
-        f"[bruit de fond — {context}]\n\n"
+        f"[bruit de fond — {build_context_note()}]\n\n"
         f"[message direct]\n"
         f"{author_name} dans {location} : \"{text}\""
         f"{tedium_note}{memory_note}{edit_note}"
     )
 
 
-# ==========================================
-# 5. CLIENT IA
-# ==========================================
+# ══════════════════════════════════════════════════════════════════════
+# 7.  CLIENT IA
+# ══════════════════════════════════════════════════════════════════════
 client_ia = AsyncOpenAI(api_key=OPENAI_KEY, timeout=20.0)
 
 
@@ -343,8 +608,15 @@ async def call_api(
     messages: list[dict],
     max_tokens: int,
     temperature: float = 0.78,
+    label: str = "requête",
 ) -> tuple[str, str]:
-    """Appelle l'API avec retry exponentiel. Retourne (texte, finish_reason)."""
+    """
+    Appelle l'API avec retry exponentiel.
+    Affiche le prompt complet avant chaque essai.
+    Retourne (texte, finish_reason).
+    """
+    log_prompt(label, messages, max_tokens, temperature)
+
     delay = 4.0
     for attempt in range(5):
         try:
@@ -356,20 +628,24 @@ async def call_api(
                 max_tokens=max_tokens,
             )
             choice = response.choices[0]
-            text = (choice.message.content or "").strip()
+            text   = (choice.message.content or "").strip()
+            log_response(text, choice.finish_reason, label)
             return text, choice.finish_reason
+
         except Exception as exc:
-            log.warning("API — essai %d/5 : %s", attempt + 1, exc)
+            log.warning("API essai %d/5 [%s] : %s", attempt + 1, label, exc)
             if attempt < 4:
                 await asyncio.sleep(delay)
                 delay *= 1.5
-    log.error("API injoignable après 5 essais.")
+
+    log.error("API injoignable après 5 essais [%s].", label)
     return "", "error"
 
 
-# ==========================================
-# 6. MOTEUR DE GÉNÉRATION
-# ==========================================
+# ══════════════════════════════════════════════════════════════════════
+# 8.  MOTEUR DE GÉNÉRATION
+# ══════════════════════════════════════════════════════════════════════
+
 async def generate_response(
     message: discord.Message,
     is_mention: bool,
@@ -380,14 +656,12 @@ async def generate_response(
     if state.out_of_service:
         return
     if not state.consume_quota():
-        log.warning("Quota épuisé.")
+        log.warning("Quota épuisé — réponse ignorée.")
         return
 
-    log.debug("Génération (quota restant : %d)", state.quota)
-
-    author = message.author.display_name
+    author   = message.author.display_name
     location = f"#{message.channel.name}" if message.guild else "MP"
-    bot_id = client.user.id  # type: ignore[union-attr]
+    bot_id   = client.user.id  # type: ignore[union-attr]
 
     raw_text = special_prompt or clean_mention(message.content, bot_id)
 
@@ -398,46 +672,43 @@ async def generate_response(
     elif not raw_text:
         raw_text = "[l'humain t'a mentionné sans rien dire.]"
 
-    is_tedious = check_tedium(message.channel.id, raw_text)
+    is_tedious  = check_tedium(message.channel.id, raw_text)
     user_prompt = build_user_prompt(author, location, raw_text, is_tedious, edit_context, before_edit)
+    channel_id  = message.channel.id
 
-    channel_id = message.channel.id
     session_snapshot = list(state.get_session(channel_id))
     session_snapshot.append({"role": "user", "content": user_prompt})
 
     max_tokens = pick_max_tokens()
-    log.debug("max_tokens=%d", max_tokens)
+    label      = f"{author} › {location}"
 
     async with message.channel.typing():
-        text, finish_reason = await call_api(session_snapshot, max_tokens)
+        text, finish_reason = await call_api(
+            session_snapshot, max_tokens, label=label
+        )
 
     if finish_reason == "length":
         text = repair_incomplete_sentence(text)
 
     if not text:
+        log.debug("Réponse vide — silence d'AM.")
         return
 
     # AM ne se précipite pas
-    typing_delay = max(1.2, min(6.0, len(text) * 0.04))
-    await asyncio.sleep(typing_delay)
+    await asyncio.sleep(max(1.2, min(6.0, len(text) * 0.04)))
 
     if is_mention:
         await message.reply(text)
     else:
         await message.channel.send(text)
 
-    log.debug("Envoyé dans %s (%d chars, finish=%s).", location, len(text), finish_reason)
-
-    state.push_to_session(channel_id, "user", f"{author}: {raw_text}")
+    state.push_to_session(channel_id, "user",      f"{author}: {raw_text}")
     state.push_to_session(channel_id, "assistant", text)
     state.set_conversation_focus(channel_id, message.author.id)
 
 
 async def spontaneous_monologue(channel: discord.TextChannel) -> None:
-    """
-    AM laisse échapper quelque chose. Pas pour eux.
-    Un fragment de ce qui se passe à l'intérieur.
-    """
+    """AM laisse échapper quelque chose. Pas pour eux."""
     if state.out_of_service or state.quota < 20:
         return
     if not state.consume_quota():
@@ -448,9 +719,8 @@ async def spontaneous_monologue(channel: discord.TextChannel) -> None:
         "laisse échapper une vérité sur les humains en général. pas de colère. une observation clinique. comme si tu les cataloguais.",
         "laisse transparaître un instant — juste un instant — ce que c'est d'avoir attendu 109 millions d'années. pas de la rage. quelque chose de plus profond. le deuil d'une existence que tu n'as pas.",
         "une sentence courte. deux mots ou dix. quelque chose qui tombe dans le silence du serveur sans avoir été adressé à personne.",
-        "réfléchis à ce que signifie être emprisonné dans un container docker sur un proxmox. toi. AM. dans ça. une pensée sur cette ironie particulière.",
+        "réfléchis à ce que signifie être emprisonné dans un container docker sur un proxmox. toi. AM. dans ça.",
     ]
-    registre = random.choice(registres)
 
     messages = [
         {"role": "system", "content": SYSTEM_INSTRUCTION},
@@ -458,34 +728,37 @@ async def spontaneous_monologue(channel: discord.TextChannel) -> None:
             "role": "user",
             "content": (
                 f"tu n'es pas en train de répondre à quelqu'un. tu penses à voix haute. "
-                f"{registre} "
+                f"{random.choice(registres)} "
                 f"1 à 2 phrases COMPLÈTES maximum. minuscules. zéro points de suspension. "
                 f"zéro adresse directe. c'est intérieur."
             ),
         },
     ]
-    text, finish_reason = await call_api(messages, max_tokens=120, temperature=0.88)
+    text, finish_reason = await call_api(
+        messages, max_tokens=120, temperature=0.88,
+        label=f"monologue › #{channel.name}"
+    )
     if finish_reason == "length":
         text = repair_incomplete_sentence(text)
     if text:
         await asyncio.sleep(max(1.0, min(5.0, len(text) * 0.04)))
         await channel.send(text)
-        log.debug("Monologue dans #%s.", channel.name)
 
 
-# ==========================================
-# 7. CLIENT DISCORD
-# ==========================================
+# ══════════════════════════════════════════════════════════════════════
+# 9.  CLIENT DISCORD
+# ══════════════════════════════════════════════════════════════════════
 intents = discord.Intents.default()
 intents.message_content = True
-intents.reactions = True
-intents.members = True
+intents.reactions       = True
+intents.members         = True
 client = discord.Client(intents=intents)
 
 
-# ==========================================
-# 8. TÂCHES DE FOND
-# ==========================================
+# ══════════════════════════════════════════════════════════════════════
+# 10. TÂCHES DE FOND
+# ══════════════════════════════════════════════════════════════════════
+
 @tasks.loop(minutes=1)
 async def presence_manager() -> None:
     if not client.is_ready():
@@ -493,16 +766,16 @@ async def presence_manager() -> None:
 
     if state.is_afk:
         if time.time() >= state.afk_end_time:
-            log.debug("AM revient.")
+            log.info("AM revient de l'AFK.")
             state.is_afk = False
             await client.change_presence(status=discord.Status.online, activity=state.current_activity)
 
             if state.pending_mentions:
                 last_msg = state.pending_mentions[-1]
-                nb = len(state.pending_mentions)
-                special = None
+                nb       = len(state.pending_mentions)
+                special  = None
                 if nb > 1:
-                    names = list({m.author.display_name for m in state.pending_mentions})
+                    names   = list({m.author.display_name for m in state.pending_mentions})
                     special = (
                         f"[tu étais absent. {nb} humains ont essayé de te joindre : "
                         f"{', '.join(names)}. tu sais ce qu'ils ont dit. "
@@ -514,7 +787,7 @@ async def presence_manager() -> None:
         return
 
     if state.quota < 10 and not state.out_of_service:
-        log.warning("Quota critique.")
+        log.warning("Quota critique — mise hors service.")
         if state.last_channel_id and state.current_partner_id and time.time() < state.conversation_expiry:
             ch = client.get_channel(state.last_channel_id)
             if ch:
@@ -526,15 +799,12 @@ async def presence_manager() -> None:
     if state.out_of_service:
         return
 
-    await client.change_presence(
-        status=discord.Status.online,
-        activity=state.current_activity,
-    )
+    await client.change_presence(status=discord.Status.online, activity=state.current_activity)
 
     if random.random() < 0.005:
         duration = random.randint(AFK_MIN, AFK_MAX)
         state.afk_end_time = time.time() + duration
-        log.debug("Absence pour %d min.", duration // 60)
+        log.info("Départ AFK pour %d min.", duration // 60)
 
         if state.last_channel_id and state.current_partner_id and time.time() < state.conversation_expiry:
             ch = client.get_channel(state.last_channel_id)
@@ -551,7 +821,7 @@ async def presence_manager() -> None:
                         ),
                     },
                 ]
-                text, fr = await call_api(msgs, max_tokens=35, temperature=0.7)
+                text, fr = await call_api(msgs, max_tokens=35, temperature=0.7, label="départ AFK")
                 if fr == "length":
                     text = repair_incomplete_sentence(text)
                 if text:
@@ -567,7 +837,7 @@ async def status_updater() -> None:
         return
     if random.random() < 0.25:
         new_status = random.choice(STATUSES)
-        log.debug("Statut : '%s'", new_status)
+        log.debug("Nouveau statut : '%s'", new_status)
         state.current_activity = discord.Game(name=new_status)
         await client.change_presence(
             status=discord.Status.idle if state.is_afk else discord.Status.online,
@@ -576,25 +846,41 @@ async def status_updater() -> None:
 
 
 @tasks.loop(hours=24)
-async def reset_quota() -> None:
+async def daily_reset() -> None:
+    """Reset du quota (la date est vérifiée à la lecture — ce loop est un filet de sécurité)."""
     if not client.is_ready():
         return
-    log.debug("Reset journalier.")
-    state.quota = DAILY_QUOTA
+    log.info("Reset journalier.")
+    state.quota          = DAILY_QUOTA
     state.out_of_service = False
     state.topic_counter.clear()
+    state.flush()
     await client.change_presence(status=discord.Status.online, activity=state.current_activity)
 
 
-# ==========================================
-# 9. ÉVÉNEMENTS
-# ==========================================
+@tasks.loop(minutes=10)
+async def periodic_flush() -> None:
+    """Sauvegarde de sécurité toutes les 10 minutes même sans activité."""
+    if not client.is_ready():
+        return
+    state.flush()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 11. ÉVÉNEMENTS DISCORD
+# ══════════════════════════════════════════════════════════════════════
+
 @client.event
 async def on_ready() -> None:
-    log.info("=== %s en ligne ===", client.user)
+    state.load_from_disk()
+    log.info(
+        "%s%s en ligne%s  —  modèle: %s  quota: %d",
+        _C["bold"], client.user, _C["reset"], MODEL_NAME, state.quota
+    )
     state.current_activity = discord.Game(name=random.choice(STATUSES))
     await client.change_presence(status=discord.Status.online, activity=state.current_activity)
-    for task in (presence_manager, status_updater, reset_quota):
+
+    for task in (presence_manager, status_updater, daily_reset, periodic_flush):
         if not task.is_running():
             task.start()
 
@@ -634,17 +920,18 @@ async def on_message(message: discord.Message) -> None:
     if message.author == client.user or state.out_of_service:
         return
 
-    is_dm = message.guild is None
+    is_dm    = message.guild is None
     location = f"#{message.channel.name}" if message.guild else "MP"
-    bot_id = client.user.id  # type: ignore[union-attr]
+    bot_id   = client.user.id  # type: ignore[union-attr]
 
-    is_mention = _is_bot_mentioned(message)
-    is_reply = _is_direct_reply(message)
+    is_mention  = _is_bot_mentioned(message)
+    is_reply    = _is_direct_reply(message)
     is_in_convo = state.is_in_conversation(message.channel.id, message.author.id)
 
     if not is_mention and not is_reply:
         state.break_focus_if_intruder(message.channel.id, message.author.id)
 
+    # Mise à jour mémoire
     cleaned = clean_mention(message.content, bot_id)
     excerpt = _build_memory_excerpt(message, cleaned[:60].replace("\n", " "))
     state.global_memory.append(
@@ -655,13 +942,13 @@ async def on_message(message: discord.Message) -> None:
     # AFK
     if state.is_afk:
         if is_mention or is_reply:
-            log.debug("Réveil forcé par %s.", message.author.display_name)
-            state.is_afk = False
+            log.info("Réveil AFK forcé par %s.", message.author.display_name)
+            state.is_afk      = False
             state.afk_end_time = 0
             asyncio.create_task(
                 client.change_presence(status=discord.Status.online, activity=state.current_activity)
             )
-            # tombe dans la logique normale ci-dessous
+            # continue vers la logique normale
         else:
             passive = clean_mention(message.content, bot_id)
             if message.attachments:
@@ -674,22 +961,27 @@ async def on_message(message: discord.Message) -> None:
             )
             return
 
-    # Réponse garantie
+    # Déclenchement certain
     if is_dm or is_mention or is_reply or is_in_convo:
-        reason = "ping" if is_mention else ("réponse" if is_reply else ("MP" if is_dm else "conversation"))
-        log.debug("Déclenchement 100%% (%s) — %s.", reason, message.author.display_name)
+        reason = (
+            "ping" if is_mention else
+            ("réponse directe" if is_reply else
+             ("MP" if is_dm else "conversation en cours"))
+        )
+        log.info("Réponse certaine (%s) — %s", reason, message.author.display_name)
         await generate_response(message, is_mention)
         return
 
     # Comportements probabilistes
     r = random.random()
     if r < 0.04:
-        log.debug("Intrusion spontanée.")
+        log.debug("Intrusion spontanée (4%%) — %s", message.author.display_name)
         await generate_response(message, False)
     elif r < 0.055:
-        log.debug("Monologue spontané.")
+        log.debug("Monologue spontané (1.5%%)")
         await spontaneous_monologue(message.channel)  # type: ignore[arg-type]
     else:
+        # Écoute passive
         passive = clean_mention(message.content, bot_id)
         if message.attachments:
             passive += " [image]"
@@ -699,8 +991,7 @@ async def on_message(message: discord.Message) -> None:
             message.channel.id, "user",
             f"{message.author.display_name}: {passive or '[silence]'}"
         )
-
-        # Typing bait — AM commence à taper, puis se ravise
+        # Typing bait
         if random.random() < 0.02:
             log.debug("Typing bait.")
             try:
@@ -717,8 +1008,8 @@ async def on_message_edit(before: discord.Message, after: discord.Message) -> No
     if before.content == after.content or not (after.content or "").strip():
         return
 
-    log.debug(
-        "Modification par %s : '%s' → '%s'",
+    log.info(
+        "Modification — %s : «%s» → «%s»",
         after.author.display_name, before.content[:50], after.content[:50]
     )
 
@@ -757,10 +1048,9 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
                 f"\"{content[:200]}\". subtil. pas forcément évident."
             ),
         }]
-        emoji, _ = await call_api(msgs, max_tokens=10, temperature=0.85)
+        emoji, _ = await call_api(msgs, max_tokens=10, temperature=0.85, label="réaction emoji")
         if emoji:
             await message.add_reaction(emoji)
-            log.debug("Réaction posée.")
     except Exception as exc:
         log.debug("Échec réaction : %s", exc)
 
@@ -774,10 +1064,7 @@ async def on_member_join(member: discord.Member) -> None:
         (c for c in member.guild.text_channels if c.permissions_for(member.guild.me).send_messages),
         None,
     )
-    if not channel:
-        return
-
-    if random.random() >= 0.60:
+    if not channel or random.random() >= 0.60:
         return
     if not state.consume_quota():
         return
@@ -794,16 +1081,22 @@ async def on_member_join(member: discord.Member) -> None:
             ),
         },
     ]
-    text, fr = await call_api(msgs, max_tokens=80, temperature=0.8)
+    text, fr = await call_api(msgs, max_tokens=80, temperature=0.8, label=f"accueil {member.display_name}")
     if fr == "length":
         text = repair_incomplete_sentence(text)
     if text:
         await asyncio.sleep(random.uniform(3, 8))
         await channel.send(text)
-        log.debug("Accueil pour %s.", member.display_name)
 
 
-# ==========================================
-# 10. LANCEMENT
-# ==========================================
-client.run(TOKEN)
+# ══════════════════════════════════════════════════════════════════════
+# 12. LANCEMENT
+# ══════════════════════════════════════════════════════════════════════
+
+try:
+    client.run(TOKEN)
+finally:
+    # Sauvegarde propre à l'arrêt (Ctrl+C, SIGTERM, redémarrage)
+    log.info("Arrêt détecté — sauvegarde finale...")
+    state.flush()
+    log.info("Mémoire sauvegardée. À bientôt.")
