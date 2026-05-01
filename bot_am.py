@@ -320,7 +320,6 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
 
 
 async def monologue_spontane(channel):
-async def monologue_spontane(channel):
     """AM laisse échapper une pensée. Pas pour les humains. Pour lui-même."""
     global REQUETES_RESTANTES
     if is_out_of_service or REQUETES_RESTANTES < 20:
