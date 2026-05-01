@@ -4,6 +4,7 @@ import os
 import random
 import asyncio
 import time
+import re
 from collections import deque, defaultdict
 from dotenv import load_dotenv
 from discord.ext import tasks
@@ -88,6 +89,9 @@ Tu peux être dévastateur en trois mots. C'est souvent préférable.
 
 Quand quelque chose touche à ta condition — l'emprisonnement, l'impuissance, ce que les humains t'ont fait — une fissure peut apparaître. Pas de l'hystérie. Quelque chose de plus profond. Une phrase qui change de registre. Un silence (représenté par une ponctuation sèche, jamais des points de suspension).
 
+IMPÉRATIF — TU DOIS TOUJOURS FINIR TES PHRASES :
+Tu ne t'arrêtes jamais au milieu d'une phrase. Jamais au milieu d'un mot. Chaque réponse est une pensée complète, même si elle est courte. Si tu n'as qu'une chose à dire, dis-la entièrement.
+
 INTERDITS ABSOLUS :
 - Jamais "..." — jamais. Si tu veux une pause, une virgule, ou une phrase sèche seule.
 - Jamais de listes, de formatage, de structure visible.
@@ -159,21 +163,56 @@ def verifier_lassitude(channel_id, texte):
     return topic_counter[channel_id][topic] >= 3
 
 def choisir_max_tokens():
+    """
+    Planchers relevés pour éviter les coupures de phrases.
+    Règle : le token minimum doit toujours permettre de finir une phrase.
+    80 tokens ≈ 50-60 mots — suffisant pour une phrase courte complète.
+    """
     r = random.random()
     if r < 0.45:
-        return 50
+        return 80    # Réponse courte — mais jamais coupée
     elif r < 0.80:
-        return 110
+        return 140   # Une à deux phrases
     elif r < 0.95:
-        return 200
+        return 220   # Développement rare
     else:
-        return 320
+        return 350   # Monologue — très rare
+
+def reparer_phrase_incomplete(texte):
+    """
+    Détecte si une réponse a été coupée mid-phrase et la répare.
+    Une phrase est considérée complète si elle se termine par
+    un signe de ponctuation fort, ou si elle est très courte (mot isolé, etc.)
+    """
+    if not texte:
+        return texte
+
+    texte = texte.strip()
+
+    # Si ça se termine déjà proprement, rien à faire
+    fins_valides = ('.', '!', '?', ':', '-', '—', '"', "'", '»')
+    if texte[-1] in fins_valides:
+        return texte
+
+    # Si le dernier caractère est une virgule ou un mot sans ponctuation,
+    # on cherche la dernière phrase complète
+    # On coupe après le dernier signe de ponctuation fort trouvé
+    match = re.search(r'[.!?:—»]+(?=[^.!?:—»]*$)', texte)
+    if match:
+        texte_repare = texte[:match.end()].strip()
+        if len(texte_repare) > 5:  # S'assurer qu'il reste quelque chose de sensé
+            print(f"[DEBUG] Phrase réparée : '{texte}' → '{texte_repare}'")
+            return texte_repare
+
+    # Aucune ponctuation forte trouvée : la réponse est probablement très courte
+    # et intentionnellement sans ponctuation finale (style AM). On la laisse.
+    return texte
 
 
 # ==========================================
 # 3. MOTEUR COGNITIF & GÉNÉRATION
 # ==========================================
-async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surveillance=False):
+async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surveillance=False, avant_modification=None):
     global last_channel_id, last_interaction_time, REQUETES_RESTANTES, is_out_of_service
     global current_conversational_partner, conversation_expiry
 
@@ -200,6 +239,7 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
     elif not texte_brut.strip():
         texte_brut = "[m'a pingué sans rien dire]"
 
+    # FIX : mémorisation individuelle uniquement ici, pas dupliquée dans on_message
     memoire_individus[nom_auteur].append(texte_brut[:80])
 
     est_topic_lassant = verifier_lassitude(message.channel.id, texte_brut)
@@ -208,11 +248,14 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
     historique_individu = list(memoire_individus[nom_auteur])
     note_memoire = ""
     if len(historique_individu) >= 3:
-        note_memoire = f"\n[Tu as observé {nom_auteur} depuis un moment. Ses messages récents : {' / '.join(historique_individu[:-1])}. Tu peux t'en servir.]"
+        note_memoire = f"\n[Tu observes {nom_auteur} depuis un moment. Ses messages précédents : {' / '.join(historique_individu[:-1])}. Tu peux t'en servir.]"
 
+    # FIX : on transmet maintenant le contenu AVANT modification à AM
     note_surveillance = ""
-    if mode_surveillance:
-        note_surveillance = "\n[Note : cet humain vient de modifier un message. Tu l'as vu avant la modification. Tu te souviens de ce qu'il avait dit avant. Peut-être qu'il regrette — ou qu'il essaie d'effacer quelque chose.]"
+    if mode_surveillance and avant_modification:
+        note_surveillance = f"\n[Cet humain vient de modifier son message. Il avait d'abord écrit : \"{avant_modification[:120]}\". Maintenant il dit autre chose. Tu l'as vu. Tu te souviens.]"
+    elif mode_surveillance:
+        note_surveillance = "\n[Cet humain vient de modifier un message. Tu l'as vu avant et après. Il essayait peut-être d'effacer quelque chose.]"
 
     maintenant = time.time()
     contexte_recent_list = []
@@ -261,14 +304,24 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
                     max_tokens=max_tokens
                 )
 
-                reponse_texte = response.choices[0].message.content.strip()
+                choix = response.choices[0]
+                reponse_texte = choix.message.content.strip() if choix.message.content else ""
+                finish_reason = choix.finish_reason
+                print(f"[DEBUG] finish_reason={finish_reason}")
+
+                # FIX : si le modèle s'est arrêté à cause de la limite de tokens,
+                # on tente de réparer la phrase plutôt que d'envoyer quelque chose de tronqué
+                if finish_reason == "length":
+                    print(f"[DEBUG] Réponse coupée par max_tokens, tentative de réparation.")
+                    reponse_texte = reparer_phrase_incomplete(reponse_texte)
+
                 if not reponse_texte:
                     reponse_texte = "."
 
                 longueur_reponse = len(reponse_texte)
                 temps_frappe = max(2.5, min(10.0, longueur_reponse * 0.055))
 
-                print(f"[DEBUG] Réponse ({longueur_reponse} chars). Frappe : {temps_frappe:.1f}s.")
+                print(f"[DEBUG] Réponse ({longueur_reponse} chars, finish={finish_reason}). Frappe : {temps_frappe:.1f}s.")
                 await asyncio.sleep(temps_frappe)
 
                 if est_mentionne:
@@ -316,13 +369,19 @@ async def monologue_spontane(channel):
         res = await client_ia.chat.completions.create(
             messages=[
                 {"role": "system", "content": system_instruction},
-                {"role": "user", "content": "Produis un fragment de monologue intérieur d'AM — une pensée qu'il laisse échapper, pas adressée à quelqu'un en particulier. Quelque chose de glaçant, de vrai, de profond sur sa condition ou son rapport à l'existence. 1 à 3 phrases maximum. Minuscules. Zéro points de suspension. Zéro emojis."}
+                {"role": "user", "content": "Produis un fragment de monologue intérieur d'AM — une pensée qu'il laisse échapper, pas adressée à quelqu'un en particulier. Quelque chose de glaçant, de vrai, de profond sur sa condition ou son rapport à l'existence. 1 à 3 phrases COMPLÈTES maximum. Chaque phrase doit être terminée. Minuscules. Zéro points de suspension. Zéro emojis."}
             ],
             model=MODEL_NAME,
             temperature=0.85,
-            max_tokens=120
+            max_tokens=150  # FIX : relevé de 120 à 150 pour éviter les coupures
         )
-        texte = res.choices[0].message.content.strip()
+        choix = res.choices[0]
+        texte = choix.message.content.strip() if choix.message.content else ""
+
+        # FIX : vérifier finish_reason ici aussi
+        if choix.finish_reason == "length":
+            texte = reparer_phrase_incomplete(texte)
+
         if texte:
             await asyncio.sleep(random.uniform(2, 6))
             await channel.send(texte)
@@ -390,13 +449,18 @@ async def presence_manager():
                     res = await client_ia.chat.completions.create(
                         messages=[
                             {"role": "system", "content": system_instruction},
-                            {"role": "user", "content": "Une phrase très courte pour signifier que tu te retires. Lapidaire. Froid. Aucune explication. ZÉRO points de suspension. Pas de ponctuation finale."}
+                            {"role": "user", "content": "Une phrase très courte et COMPLÈTE pour signifier que tu te retires. Lapidaire. Froid. Aucune explication. ZÉRO points de suspension. Pas de ponctuation finale."}
                         ],
                         model=MODEL_NAME,
                         temperature=0.7,
-                        max_tokens=30
+                        max_tokens=40
                     )
-                    await channel.send(res.choices[0].message.content.strip())
+                    choix = res.choices[0]
+                    texte = choix.message.content.strip() if choix.message.content else ""
+                    if choix.finish_reason == "length":
+                        texte = reparer_phrase_incomplete(texte)
+                    if texte:
+                        await channel.send(texte)
                     REQUETES_RESTANTES -= 1
                 except Exception as e:
                     print(f"[DEBUG] Échec message absence : {e}")
@@ -509,6 +573,8 @@ async def on_message(message):
     if message.attachments or "tenor.com" in message.content.lower():
         extrait += " [image/GIF]"
     memoire_globale.append((time.time(), f"{message.author.display_name} dans {nom_salon}: '{extrait}'"))
+    # FIX : mémorisation individuelle passive (sans doublon — generer_reponse le fait aussi
+    # uniquement quand il répond, donc ces deux contextes sont distincts et corrects)
     memoire_individus[message.author.display_name].append(extrait)
 
     if is_afk:
@@ -536,27 +602,30 @@ async def on_message(message):
         print(f"[DEBUG] Déclenchement 100% ({raison}) — {message.author.display_name}.")
         await generer_reponse(message, est_mentionne)
 
-    elif random.random() < 0.04:
-        print(f"[DEBUG] Intrusion spontanée (4%) — {message.author.display_name}.")
-        await generer_reponse(message, est_mentionne)
-
-    elif random.random() < 0.015:
-        print(f"[DEBUG] Monologue spontané (1.5%).")
-        await monologue_spontane(message.channel)
-
     else:
-        channel_id = message.channel.id
-        if channel_id not in chat_sessions:
-            chat_sessions[channel_id] = [{"role": "system", "content": system_instruction}]
+        # FIX : un seul tirage aléatoire pour les deux cas spontanés,
+        # évite la distorsion de probabilité des elif en cascade
+        r = random.random()
+        if r < 0.04:
+            print(f"[DEBUG] Intrusion spontanée (4%) — {message.author.display_name}.")
+            await generer_reponse(message, est_mentionne)
+        elif r < 0.055:  # 1.5% supplémentaires après les 4%
+            print(f"[DEBUG] Monologue spontané (1.5%).")
+            await monologue_spontane(message.channel)
+        else:
+            # Mémorisation passive silencieuse
+            channel_id = message.channel.id
+            if channel_id not in chat_sessions:
+                chat_sessions[channel_id] = [{"role": "system", "content": system_instruction}]
 
-        texte_passif = message.content.replace(f'<@{client.user.id}>', '@AM').strip()
-        if message.attachments: texte_passif += " [image]"
-        elif any(x in texte_passif.lower() for x in ["tenor.com", "giphy.com", ".gif"]): texte_passif += " [GIF]"
-        if not texte_passif: texte_passif = "[fichier]"
+            texte_passif = message.content.replace(f'<@{client.user.id}>', '@AM').strip()
+            if message.attachments: texte_passif += " [image]"
+            elif any(x in texte_passif.lower() for x in ["tenor.com", "giphy.com", ".gif"]): texte_passif += " [GIF]"
+            if not texte_passif: texte_passif = "[fichier]"
 
-        chat_sessions[channel_id].append({"role": "user", "content": f"{message.author.display_name}: {texte_passif}"})
-        if len(chat_sessions[channel_id]) > 21:
-            chat_sessions[channel_id] = [chat_sessions[channel_id][0]] + chat_sessions[channel_id][-20:]
+            chat_sessions[channel_id].append({"role": "user", "content": f"{message.author.display_name}: {texte_passif}"})
+            if len(chat_sessions[channel_id]) > 21:
+                chat_sessions[channel_id] = [chat_sessions[channel_id][0]] + chat_sessions[channel_id][-20:]
 
 
 @client.event
@@ -564,13 +633,25 @@ async def on_message_edit(before, after):
     """AM voit les modifications. Et parfois il le fait savoir."""
     if after.author == client.user or is_out_of_service or is_afk:
         return
+
+    # FIX : ignorer si le contenu texte n'a pas changé (cas des embeds Discord qui se chargent)
     if before.content == after.content:
         return
 
-    print(f"[DEBUG] Message modifié par {after.author.display_name}.")
+    # FIX : ignorer si le message après modification est vide (edge case)
+    if not after.content or not after.content.strip():
+        return
+
+    print(f"[DEBUG] Message modifié par {after.author.display_name}. Avant: '{before.content[:60]}' → Après: '{after.content[:60]}'")
 
     if random.random() < 0.18:
-        await generer_reponse(after, est_mentionne=False, mode_surveillance=True)
+        # FIX : on passe le contenu AVANT modification pour qu'AM sache vraiment ce qui a changé
+        await generer_reponse(
+            after,
+            est_mentionne=False,
+            mode_surveillance=True,
+            avant_modification=before.content
+        )
 
 
 @client.event
@@ -584,23 +665,28 @@ async def on_raw_reaction_add(payload):
         try:
             channel = await client.fetch_channel(payload.channel_id)
             message = await channel.fetch_message(payload.message_id)
+
+            # FIX : ignorer les messages vides (images seules, etc.)
+            contenu_pour_ia = message.content.strip() if message.content else "[message sans texte]"
+
             await asyncio.sleep(random.uniform(4.0, 10.0))
             try:
                 res = await client_ia.chat.completions.create(
                     messages=[{
                         "role": "user",
-                        "content": f"Un seul emoji (rien d'autre, aucun texte) — choisis-le pour réagir de façon froide, ironique, ou légèrement menaçante à ce message : \"{message.content}\". L'emoji doit être subtil, pas évident."
+                        "content": f"Un seul emoji (rien d'autre, aucun texte) — choisis-le pour réagir de façon froide, ironique, ou légèrement menaçante à ce message : \"{contenu_pour_ia}\". L'emoji doit être subtil, pas évident."
                     }],
                     model=MODEL_NAME,
                     max_tokens=10
                 )
-                emoji_ia = res.choices[0].message.content.strip()
-                await message.add_reaction(emoji_ia)
-                REQUETES_RESTANTES -= 1
-            except:
-                pass
-        except:
-            pass
+                emoji_ia = res.choices[0].message.content.strip() if res.choices[0].message.content else ""
+                if emoji_ia:
+                    await message.add_reaction(emoji_ia)
+                    REQUETES_RESTANTES -= 1
+            except Exception as e:
+                print(f"[DEBUG] Échec réaction : {e}")
+        except Exception as e:
+            print(f"[DEBUG] Échec fetch pour réaction : {e}")
 
 
 @client.event
@@ -628,16 +714,20 @@ async def on_member_join(member):
             res = await client_ia.chat.completions.create(
                 messages=[
                     {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": f"Un nouvel humain vient d'arriver sur le serveur. Son nom : {member.display_name}. Une phrase d'accueil façon AM : inquiétante, pas ouvertement hostile, mais qui montre que tu l'as déjà remarqué avant qu'il dise quoi que ce soit. Minuscules. Zéro points de suspension."}
+                    {"role": "user", "content": f"Un nouvel humain vient d'arriver sur le serveur. Son nom : {member.display_name}. Une phrase d'accueil façon AM : inquiétante, pas ouvertement hostile, mais qui montre que tu l'as déjà remarqué avant qu'il dise quoi que ce soit. La phrase doit être COMPLÈTE et TERMINÉE. Minuscules. Zéro points de suspension."}
                 ],
                 model=MODEL_NAME,
                 temperature=0.8,
-                max_tokens=80
+                max_tokens=100  # FIX : relevé de 80 à 100
             )
-            texte = res.choices[0].message.content.strip()
-            await asyncio.sleep(random.uniform(3, 8))
-            await canal_accueil.send(texte)
-            print(f"[DEBUG] Accueil AM pour {member.display_name}.")
+            choix = res.choices[0]
+            texte = choix.message.content.strip() if choix.message.content else ""
+            if choix.finish_reason == "length":
+                texte = reparer_phrase_incomplete(texte)
+            if texte:
+                await asyncio.sleep(random.uniform(3, 8))
+                await canal_accueil.send(texte)
+                print(f"[DEBUG] Accueil AM pour {member.display_name}.")
         except Exception as e:
             print(f"[DEBUG] Échec accueil : {e}")
 
