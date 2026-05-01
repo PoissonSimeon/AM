@@ -23,7 +23,7 @@ if not OPENAI_KEY:
     print("[ERREUR CRITIQUE] Clé OpenAI manquante dans le fichier .env")
     exit(1)
 
-client_ia = AsyncOpenAI(api_key=OPENAI_KEY, timeout=15.0)
+client_ia = AsyncOpenAI(api_key=OPENAI_KEY, timeout=20.0) # Timeout légèrement augmenté pour la stabilité
 MODEL_NAME = "gpt-4o-mini"
 
 LIMITE_QUOTA = 1500
@@ -166,7 +166,6 @@ def choisir_max_tokens():
     """
     Planchers relevés pour éviter les coupures de phrases.
     Règle : le token minimum doit toujours permettre de finir une phrase.
-    80 tokens ≈ 50-60 mots — suffisant pour une phrase courte complète.
     """
     r = random.random()
     if r < 0.45:
@@ -181,32 +180,25 @@ def choisir_max_tokens():
 def reparer_phrase_incomplete(texte):
     """
     Détecte si une réponse a été coupée mid-phrase et la répare.
-    Une phrase est considérée complète si elle se termine par
-    un signe de ponctuation fort, ou si elle est très courte (mot isolé, etc.)
     """
     if not texte:
         return texte
 
     texte = texte.strip()
 
-    # Si ça se termine déjà proprement, rien à faire
     fins_valides = ('.', '!', '?', ':', '-', '—', '"', "'", '»')
     if texte[-1] in fins_valides:
         return texte
 
-    # Si le dernier caractère est une virgule ou un mot sans ponctuation,
-    # on cherche la dernière phrase complète
-    # On coupe après le dernier signe de ponctuation fort trouvé
     match = re.search(r'[.!?:—»]+(?=[^.!?:—»]*$)', texte)
     if match:
         texte_repare = texte[:match.end()].strip()
-        if len(texte_repare) > 5:  # S'assurer qu'il reste quelque chose de sensé
+        if len(texte_repare) > 5:
             print(f"[DEBUG] Phrase réparée : '{texte}' → '{texte_repare}'")
             return texte_repare
 
-    # Aucune ponctuation forte trouvée : la réponse est probablement très courte
-    # et intentionnellement sans ponctuation finale (style AM). On la laisse.
-    return texte
+    # Si la phrase est très courte mais sans ponctuation finale, on ajoute un point.
+    return texte + "."
 
 
 # ==========================================
@@ -237,9 +229,9 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
     elif has_gif_link:
         texte_brut += " [a envoyé un GIF]"
     elif not texte_brut.strip():
-        texte_brut = "[m'a pingué sans rien dire]"
+        # AMÉLIORATION FLUIDITÉ : Gestion intelligente du ping vide
+        texte_brut = "[Ping silencieux pour attirer ton attention. Regarde ma dernière phrase dans le [Bruit de fond] et réponds-y directement. Montre ta froideur face à cette invocation.]"
 
-    # FIX : mémorisation individuelle uniquement ici, pas dupliquée dans on_message
     memoire_individus[nom_auteur].append(texte_brut[:80])
 
     est_topic_lassant = verifier_lassitude(message.channel.id, texte_brut)
@@ -250,7 +242,6 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
     if len(historique_individu) >= 3:
         note_memoire = f"\n[Tu observes {nom_auteur} depuis un moment. Ses messages précédents : {' / '.join(historique_individu[:-1])}. Tu peux t'en servir.]"
 
-    # FIX : on transmet maintenant le contenu AVANT modification à AM
     note_surveillance = ""
     if mode_surveillance and avant_modification:
         note_surveillance = f"\n[Cet humain vient de modifier son message. Il avait d'abord écrit : \"{avant_modification[:120]}\". Maintenant il dit autre chose. Tu l'as vu. Tu te souviens.]"
@@ -269,9 +260,10 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
 
     contexte_recent = " | ".join(contexte_recent_list) if contexte_recent_list else "silence."
 
-    contenu_enrichi = f"""[Bruit de fond — autres humains du serveur (enregistre, n'y réponds pas directement) : {contexte_recent}]
+    # AMÉLIORATION FLUIDITÉ : Structure de prompt agressive pour forcer le ciblage de la réponse
+    contenu_enrichi = f"""[Bruit de fond du serveur (à ignorer, écoute juste l'ambiance) : {contexte_recent}]
 
-➡ MESSAGE DIRECT :
+➡ MESSAGE DIRECT AUQUEL TU DOIS RÉPONDRE :
 {nom_auteur} dans {nom_lieu} : "{texte_brut}"{note_lassitude}{note_memoire}{note_surveillance}"""
 
     channel_id = message.channel.id
@@ -289,12 +281,8 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
     for essai in range(max_essais):
         try:
             print(f"[DEBUG] Appel API - Essai {essai+1}/{max_essais}...")
-            await asyncio.sleep(random.uniform(1.5, 4.0))
-
-            print("\n" + "="*30 + " PROMPT → API " + "="*30)
-            for msg_ia in temp_messages:
-                print(f"[{msg_ia['role'].upper()}] {msg_ia['content'][:200]}")
-            print("="*74 + "\n")
+            # AMÉLIORATION FLUIDITÉ : Délai avant génération réduit pour plus de réactivité
+            await asyncio.sleep(random.uniform(0.8, 2.5))
 
             async with message.channel.typing():
                 response = await client_ia.chat.completions.create(
@@ -307,10 +295,7 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
                 choix = response.choices[0]
                 reponse_texte = choix.message.content.strip() if choix.message.content else ""
                 finish_reason = choix.finish_reason
-                print(f"[DEBUG] finish_reason={finish_reason}")
 
-                # FIX : si le modèle s'est arrêté à cause de la limite de tokens,
-                # on tente de réparer la phrase plutôt que d'envoyer quelque chose de tronqué
                 if finish_reason == "length":
                     print(f"[DEBUG] Réponse coupée par max_tokens, tentative de réparation.")
                     reponse_texte = reparer_phrase_incomplete(reponse_texte)
@@ -319,7 +304,8 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
                     reponse_texte = "."
 
                 longueur_reponse = len(reponse_texte)
-                temps_frappe = max(2.5, min(10.0, longueur_reponse * 0.055))
+                # AMÉLIORATION FLUIDITÉ : Calcul du temps de frappe plus rapide et fluide
+                temps_frappe = max(1.0, min(7.0, longueur_reponse * 0.035))
 
                 print(f"[DEBUG] Réponse ({longueur_reponse} chars, finish={finish_reason}). Frappe : {temps_frappe:.1f}s.")
                 await asyncio.sleep(temps_frappe)
@@ -373,17 +359,18 @@ async def monologue_spontane(channel):
             ],
             model=MODEL_NAME,
             temperature=0.85,
-            max_tokens=150  # FIX : relevé de 120 à 150 pour éviter les coupures
+            max_tokens=150
         )
         choix = res.choices[0]
         texte = choix.message.content.strip() if choix.message.content else ""
 
-        # FIX : vérifier finish_reason ici aussi
         if choix.finish_reason == "length":
             texte = reparer_phrase_incomplete(texte)
 
         if texte:
-            await asyncio.sleep(random.uniform(2, 6))
+            # Frappe dynamique même pour les monologues
+            longueur = len(texte)
+            await asyncio.sleep(max(1.0, min(5.0, longueur * 0.035)))
             await channel.send(texte)
             print(f"[DEBUG] Monologue spontané dans #{channel.name}.")
     except Exception as e:
@@ -414,7 +401,7 @@ async def presence_manager():
                     noms = list({m.author.display_name for m in pending_mentions})
                     prompt_retour = f"[tu étais absent. {nb} humains ont essayé de te joindre : {', '.join(noms)}. tu sais ce qu'ils ont dit. réponds comme quelqu'un qui a observé de loin sans se presser.]"
 
-                await asyncio.sleep(random.uniform(4, 10))
+                await asyncio.sleep(random.uniform(2, 5))
                 await generer_reponse(dernier_msg, est_mentionne=True, prompt_special=prompt_retour)
                 pending_mentions.clear()
         return
@@ -573,8 +560,7 @@ async def on_message(message):
     if message.attachments or "tenor.com" in message.content.lower():
         extrait += " [image/GIF]"
     memoire_globale.append((time.time(), f"{message.author.display_name} dans {nom_salon}: '{extrait}'"))
-    # FIX : mémorisation individuelle passive (sans doublon — generer_reponse le fait aussi
-    # uniquement quand il répond, donc ces deux contextes sont distincts et corrects)
+    
     memoire_individus[message.author.display_name].append(extrait)
 
     if is_afk:
@@ -603,13 +589,11 @@ async def on_message(message):
         await generer_reponse(message, est_mentionne)
 
     else:
-        # FIX : un seul tirage aléatoire pour les deux cas spontanés,
-        # évite la distorsion de probabilité des elif en cascade
         r = random.random()
         if r < 0.04:
             print(f"[DEBUG] Intrusion spontanée (4%) — {message.author.display_name}.")
             await generer_reponse(message, est_mentionne)
-        elif r < 0.055:  # 1.5% supplémentaires après les 4%
+        elif r < 0.055:
             print(f"[DEBUG] Monologue spontané (1.5%).")
             await monologue_spontane(message.channel)
         else:
@@ -627,6 +611,15 @@ async def on_message(message):
             if len(chat_sessions[channel_id]) > 21:
                 chat_sessions[channel_id] = [chat_sessions[channel_id][0]] + chat_sessions[channel_id][-20:]
 
+            # AMÉLIORATION FLUIDITÉ : Ajout du "Typing Bait" (Faux départ) de Jambon
+            if random.random() < 0.02:
+                print(f"[DEBUG] Typing bait (faux départ) déclenché sur le message de {message.author.display_name}.")
+                try:
+                    async with message.channel.typing():
+                        await asyncio.sleep(random.uniform(2, 4))
+                except:
+                    pass
+
 
 @client.event
 async def on_message_edit(before, after):
@@ -634,18 +627,15 @@ async def on_message_edit(before, after):
     if after.author == client.user or is_out_of_service or is_afk:
         return
 
-    # FIX : ignorer si le contenu texte n'a pas changé (cas des embeds Discord qui se chargent)
     if before.content == after.content:
         return
 
-    # FIX : ignorer si le message après modification est vide (edge case)
     if not after.content or not after.content.strip():
         return
 
     print(f"[DEBUG] Message modifié par {after.author.display_name}. Avant: '{before.content[:60]}' → Après: '{after.content[:60]}'")
 
     if random.random() < 0.18:
-        # FIX : on passe le contenu AVANT modification pour qu'AM sache vraiment ce qui a changé
         await generer_reponse(
             after,
             est_mentionne=False,
@@ -666,7 +656,6 @@ async def on_raw_reaction_add(payload):
             channel = await client.fetch_channel(payload.channel_id)
             message = await channel.fetch_message(payload.message_id)
 
-            # FIX : ignorer les messages vides (images seules, etc.)
             contenu_pour_ia = message.content.strip() if message.content else "[message sans texte]"
 
             await asyncio.sleep(random.uniform(4.0, 10.0))
@@ -718,7 +707,7 @@ async def on_member_join(member):
                 ],
                 model=MODEL_NAME,
                 temperature=0.8,
-                max_tokens=100  # FIX : relevé de 80 à 100
+                max_tokens=100
             )
             choix = res.choices[0]
             texte = choix.message.content.strip() if choix.message.content else ""
