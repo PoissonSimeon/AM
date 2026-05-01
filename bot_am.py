@@ -261,6 +261,15 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
             # AMÉLIORATION FLUIDITÉ : Délai avant génération réduit pour plus de réactivité
             await asyncio.sleep(random.uniform(0.8, 2.5))
 
+            # --- AFFICHAGE EXACT DU PROMPT ENVOYÉ À L'API ---
+            print("\n" + "="*30 + " DÉBUT DU PROMPT ENVOYÉ À L'API " + "="*30)
+            for msg_ia in temp_messages:
+                print(f"[{msg_ia['role'].upper()}]")
+                print(f"{msg_ia['content']}")
+                print("-" * 50)
+            print("="*92 + "\n")
+            # ------------------------------------------------
+
             async with message.channel.typing():
                 response = await client_ia.chat.completions.create(
                     messages=temp_messages,
