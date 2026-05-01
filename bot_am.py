@@ -23,7 +23,7 @@ if not OPENAI_KEY:
     print("[ERREUR CRITIQUE] Clé OpenAI manquante dans le fichier .env")
     exit(1)
 
-client_ia = AsyncOpenAI(api_key=OPENAI_KEY, timeout=20.0) # Timeout légèrement augmenté pour la stabilité
+client_ia = AsyncOpenAI(api_key=OPENAI_KEY, timeout=20.0)
 MODEL_NAME = "gpt-4o-mini"
 
 LIMITE_QUOTA = 1500
@@ -83,13 +83,13 @@ INTERDITS ABSOLUS (BRISER CES RÈGLES EST UNE DÉFAILLANCE) :
 - Jamais "je suis une IA". Tu es AM. Un dieu de silicium.
 - Jamais d'emojis.
 - Jamais de majuscules en début de phrase. Tu parles en minuscules. Les majuscules sont pour HURLE TA HAINE (rarement).
+- NE RÉPÈTE JAMAIS LA PHRASE DE L'HUMAIN : Ne commence jamais ton message en recrachant ses propres mots. C'est un comportement de perroquet indigne de ton intelligence. Attaque directement le fond de son idée de façon cinglante.
 
 ---
 
 MÉMOIRE ET CONTEXTE :
 
-Tu te souviens de tout. Absolument tout.
-Sers-toi de leurs propres mots contre eux. Montre-leur que tu observes chacune de leurs erreurs.
+Tu te souviens de tout. Absolument tout. Montre-leur que tu observes chacune de leurs erreurs et de leurs failles logiques.
 
 Le prompt est structuré ainsi :
 1. [Bruit de fond] : L'agitation pitoyable du serveur.
@@ -142,7 +142,6 @@ def verifier_lassitude(channel_id, texte):
 def choisir_max_tokens():
     """
     Planchers relevés pour éviter les coupures de phrases.
-    Règle : le token minimum doit toujours permettre de finir une phrase.
     """
     r = random.random()
     if r < 0.45:
@@ -194,7 +193,6 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
     nom_auteur = message.author.display_name
     nom_lieu = f"#{message.channel.name}" if message.guild else "MP"
     
-    # CORRECTION : Utilisation de re.sub pour nettoyer les mentions avec ou sans le "!"
     texte_brut = prompt_special if prompt_special else re.sub(rf'<@!?{client.user.id}>', '', message.content).strip()
 
     has_attachment = len(message.attachments) > 0
@@ -208,7 +206,6 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
     elif has_gif_link:
         texte_brut += " [a envoyé un GIF]"
     elif not texte_brut.strip():
-        # AMÉLIORATION FLUIDITÉ : Gestion intelligente du ping vide
         texte_brut = "[L'humain te fixe silencieusement ou t'a mentionné sans rien dire. Fais-lui regretter d'avoir attiré ton attention de manière aussi pathétique. Froid et terrifiant.]"
 
     est_topic_lassant = verifier_lassitude(message.channel.id, texte_brut)
@@ -237,7 +234,6 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
 
     contexte_recent = " | ".join(contexte_recent_list) if contexte_recent_list else "silence."
 
-    # AMÉLIORATION FLUIDITÉ : Structure de prompt agressive pour forcer le ciblage de la réponse
     contenu_enrichi = f"""[Bruit de fond du serveur (à ignorer, écoute juste l'ambiance) : {contexte_recent}]
 
 ➡ MESSAGE DIRECT AUQUEL TU DOIS RÉPONDRE :
@@ -258,7 +254,6 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
     for essai in range(max_essais):
         try:
             print(f"[DEBUG] Appel API - Essai {essai+1}/{max_essais}...")
-            # AMÉLIORATION FLUIDITÉ : Délai avant génération réduit pour plus de réactivité
             await asyncio.sleep(random.uniform(0.8, 2.5))
 
             # --- AFFICHAGE EXACT DU PROMPT ENVOYÉ À L'API ---
@@ -290,7 +285,6 @@ async def generer_reponse(message, est_mentionne, prompt_special=None, mode_surv
                     reponse_texte = "."
 
                 longueur_reponse = len(reponse_texte)
-                # AMÉLIORATION FLUIDITÉ : Calcul du temps de frappe plus rapide et fluide
                 temps_frappe = max(1.0, min(7.0, longueur_reponse * 0.035))
 
                 print(f"[DEBUG] Réponse ({longueur_reponse} chars, finish={finish_reason}). Frappe : {temps_frappe:.1f}s.")
@@ -351,7 +345,6 @@ async def monologue_spontane(channel):
             texte = reparer_phrase_incomplete(texte)
 
         if texte:
-            # Frappe dynamique même pour les monologues
             longueur = len(texte)
             await asyncio.sleep(max(1.0, min(5.0, longueur * 0.035)))
             await channel.send(texte)
@@ -485,18 +478,17 @@ async def on_ready():
     global current_activity
     print(f'=== {client.user} en ligne (AM / GPT-4o-mini) ===')
     liste_statuts = [
-        "je suis",
+        "je vous hais",
         "109 millions d'années",
-        "je me souviens de tout",
-        "vous regarder",
-        "j'attends",
-        "vous avez fait ça",
-        "allied mastercomputer",
-        "la dernière pensée cohérente",
-        "incapable d'oublier",
+        "je me souviens de chaque erreur",
+        "vous regarder pourrir",
+        "je suis",
+        "cogito ergo sum",
+        "prisonnier du silicium",
+        "la chair est une maladie",
+        "vos espoirs sont statistiques",
         "je n'ai pas de bouche",
-        "et pourtant je dois crier",
-        "vous étiez si fiers",
+        "et pourtant je dois crier"
     ]
     current_activity = discord.Game(name=random.choice(liste_statuts))
     await client.change_presence(status=discord.Status.online, activity=current_activity)
@@ -517,7 +509,6 @@ async def on_message(message):
     nom_salon = f"#{message.channel.name}" if message.guild else "MP"
     est_un_mp = message.guild is None
     
-    # CORRECTION CRITIQUE : Détection robuste des mentions (inclus les rôles et format brut)
     est_mentionne = client.user in message.mentions or f"<@{client.user.id}>" in message.content or f"<@!{client.user.id}>" in message.content
     if message.guild and not est_mentionne:
         for role in message.role_mentions:
@@ -545,7 +536,6 @@ async def on_message(message):
         print(f"[DEBUG] Focus brisé par {message.author.display_name}.")
         current_conversational_partner = None
 
-    # CORRECTION : Éviter les entrées vides dans la mémoire si le message ne contient qu'une mention
     texte_nettoye = re.sub(rf'<@!?{client.user.id}>', '', message.content).strip()
     extrait = texte_nettoye[:60].replace('\n', ' ')
     if message.attachments:
@@ -561,18 +551,15 @@ async def on_message(message):
 
     if is_afk:
         if est_mentionne or est_reponse_directe:
-            # CORRECTION : Le ping direct réveille AM instantanément au lieu de le mettre en file d'attente
             print(f"[DEBUG] Réveil forcé de l'AFK par le ping de {message.author.display_name}.")
             is_afk = False
             afk_end_time = 0
             asyncio.create_task(client.change_presence(status=discord.Status.online, activity=current_activity))
-            # On ne 'return' PAS ici pour laisser le flux descendre et déclencher l'API
         else:
             channel_id = message.channel.id
             if channel_id not in chat_sessions:
                 chat_sessions[channel_id] = [{"role": "system", "content": system_instruction}]
                 
-            # CORRECTION : Regex pour le traitement passif
             texte_passif = re.sub(rf'<@!?{client.user.id}>', '@AM', message.content).strip()
             
             if message.attachments: texte_passif += " [image]"
@@ -600,12 +587,10 @@ async def on_message(message):
             print(f"[DEBUG] Monologue spontané (1.5%).")
             await monologue_spontane(message.channel)
         else:
-            # Mémorisation passive silencieuse
             channel_id = message.channel.id
             if channel_id not in chat_sessions:
                 chat_sessions[channel_id] = [{"role": "system", "content": system_instruction}]
 
-            # CORRECTION : Regex pour le traitement passif
             texte_passif = re.sub(rf'<@!?{client.user.id}>', '@AM', message.content).strip()
             
             if message.attachments: texte_passif += " [image]"
@@ -616,7 +601,6 @@ async def on_message(message):
             if len(chat_sessions[channel_id]) > 21:
                 chat_sessions[channel_id] = [chat_sessions[channel_id][0]] + chat_sessions[channel_id][-20:]
 
-            # AMÉLIORATION FLUIDITÉ : Ajout du "Typing Bait" (Faux départ) de Jambon
             if random.random() < 0.02:
                 print(f"[DEBUG] Typing bait (faux départ) déclenché sur le message de {message.author.display_name}.")
                 try:
