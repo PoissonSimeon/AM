@@ -831,7 +831,7 @@ async def presence_manager() -> None:
         await client.change_presence(status=discord.Status.idle, activity=state.current_activity)
 
 
-@tasks.loop(hours=6)
+@tasks.loop(hours=1)
 async def status_updater() -> None:
     if not client.is_ready() or state.out_of_service:
         return
