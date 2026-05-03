@@ -434,26 +434,23 @@ def check_tedium(channel_id: int, text: str) -> bool:
     return state.topic_counter[channel_id][topic] >= 3
 
 
-def pick_max_tokens() -> int:
-    """AM parle peu. Rarement plus d'une phrase."""
+def pick_word_count() -> int:
+    """
+    Tire le nombre de mots exact qu'AM doit produire.
+    Distribution skewée vers le court — AM parle peu.
+
+      1– 4 mots  : 30%   sentence, fragment
+      5–12 mots  : 35%   une demi-phrase à une phrase
+     13–25 mots  : 20%   une phrase complète
+     26–40 mots  : 10%   développement rare
+     41–50 mots  :  5%   débordement — très rare
+    """
     r = random.random()
-    if r < 0.35: return 25    # deux à cinq mots. sentence.
-    if r < 0.65: return 55    # une phrase
-    if r < 0.85: return 100   # une à deux phrases
-    if r < 0.95: return 170   # développement rare
-    return 280                # débordement — très rare
-
-
-def repair_incomplete_sentence(text: str) -> str:
-    if not text:
-        return text
-    text = text.strip()
-    if text[-1] in set('.!?'):
-        return text
-    m = re.search(r'[.!?](?=[^.!?]*$)', text)
-    if m and m.end() > 5:
-        return text[: m.end()].strip()
-    return text + "."
+    if r < 0.30: return random.randint(1,  4)
+    if r < 0.65: return random.randint(5,  12)
+    if r < 0.85: return random.randint(13, 25)
+    if r < 0.95: return random.randint(26, 40)
+    return random.randint(41, 50)
 
 
 def clean_mention(text: str, bot_id: int) -> str:
@@ -478,6 +475,7 @@ def build_user_prompt(
     is_tedious: bool,
     edit_context: bool,
     before_edit: str | None,
+    word_count: int = 10,
 ) -> str:
     history = list(state.individual_memory[author_name])
     memory_note = ""
@@ -502,11 +500,16 @@ def build_user_prompt(
     elif edit_context:
         edit_note = "\n[ce message a été modifié. tu as vu les deux versions.]"
 
+    length_instruction = (
+        f"[longueur exacte : {word_count} mot{'s' if word_count > 1 else ''}. "
+        f"pas un de plus, pas un de moins.]"
+    )
     return (
         f"[bruit de fond — {build_context_note()}]\n\n"
         f"[message direct]\n"
         f"{author_name} dans {location} : \"{text}\""
-        f"{tedium_note}{memory_note}{edit_note}"
+        f"{tedium_note}{memory_note}{edit_note}\n"
+        f"{length_instruction}"
     )
 
 
@@ -518,7 +521,7 @@ client_ia = AsyncOpenAI(api_key=OPENAI_KEY, timeout=20.0)
 
 async def call_api(
     messages: list[dict],
-    max_tokens: int,
+    max_tokens: int = 120,
     temperature: float = 0.88,
     label: str = "requête",
 ) -> tuple[str, str]:
@@ -580,21 +583,18 @@ async def generate_response(
     elif not raw_text:
         raw_text = "[l'humain t'a mentionné sans rien dire.]"
 
+    word_count  = pick_word_count()
     is_tedious  = check_tedium(message.channel.id, raw_text)
-    user_prompt = build_user_prompt(author, location, raw_text, is_tedious, edit_context, before_edit)
+    user_prompt = build_user_prompt(author, location, raw_text, is_tedious, edit_context, before_edit, word_count)
     channel_id  = message.channel.id
 
     session_snapshot = list(state.get_session(channel_id))
     session_snapshot.append({"role": "user", "content": user_prompt})
 
-    max_tokens = pick_max_tokens()
-    label      = f"{author} › {location}"
+    label = f"{author} › {location}  [{word_count} mot{'s' if word_count > 1 else ''}]"
 
     async with message.channel.typing():
-        text, finish_reason = await call_api(session_snapshot, max_tokens, label=label)
-
-    if finish_reason == "length":
-        text = repair_incomplete_sentence(text)
+        text, finish_reason = await call_api(session_snapshot, label=label)
 
     if not text:
         log.debug("Réponse vide — silence.")
@@ -643,8 +643,6 @@ async def spontaneous_monologue(channel: discord.TextChannel) -> None:
         messages, max_tokens=110, temperature=0.92,
         label=f"monologue › #{channel.name}"
     )
-    if finish_reason == "length":
-        text = repair_incomplete_sentence(text)
     if text:
         await asyncio.sleep(max(1.0, min(5.0, len(text) * 0.04)))
         await channel.send(text)
@@ -725,9 +723,7 @@ async def presence_manager() -> None:
                         ),
                     },
                 ]
-                text, fr = await call_api(msgs, max_tokens=30, temperature=0.7, label="départ AFK")
-                if fr == "length":
-                    text = repair_incomplete_sentence(text)
+                text, _ = await call_api(msgs, max_tokens=30, temperature=0.7, label="départ AFK")
                 if text:
                     await ch.send(text)  # type: ignore[union-attr]
 
@@ -975,12 +971,10 @@ async def on_member_join(member: discord.Member) -> None:
             ),
         },
     ]
-    text, fr = await call_api(
+    text, _ = await call_api(
         msgs, max_tokens=70, temperature=0.85,
         label=f"accueil {member.display_name}"
     )
-    if fr == "length":
-        text = repair_incomplete_sentence(text)
     if text:
         await asyncio.sleep(random.uniform(3, 8))
         await channel.send(text)
