@@ -475,7 +475,6 @@ def build_user_prompt(
     is_tedious: bool,
     edit_context: bool,
     before_edit: str | None,
-    word_count: int = 10,
 ) -> str:
     history = list(state.individual_memory[author_name])
     memory_note = ""
@@ -500,16 +499,11 @@ def build_user_prompt(
     elif edit_context:
         edit_note = "\n[ce message a été modifié. tu as vu les deux versions.]"
 
-    length_instruction = (
-        f"[longueur exacte : {word_count} mot{'s' if word_count > 1 else ''}. "
-        f"pas un de plus, pas un de moins.]"
-    )
     return (
         f"[bruit de fond — {build_context_note()}]\n\n"
         f"[message direct]\n"
         f"{author_name} dans {location} : \"{text}\""
-        f"{tedium_note}{memory_note}{edit_note}\n"
-        f"{length_instruction}"
+        f"{tedium_note}{memory_note}{edit_note}"
     )
 
 
@@ -585,13 +579,17 @@ async def generate_response(
 
     word_count  = pick_word_count()
     is_tedious  = check_tedium(message.channel.id, raw_text)
-    user_prompt = build_user_prompt(author, location, raw_text, is_tedious, edit_context, before_edit, word_count)
+    user_prompt = build_user_prompt(author, location, raw_text, is_tedious, edit_context, before_edit)
     channel_id  = message.channel.id
 
+    # La contrainte de longueur est injectée comme dernier message system —
+    # position la plus autoritaire : le modèle la voit juste avant de générer.
+    word_str    = f"{word_count} mot{'s' if word_count > 1 else ''}"
     session_snapshot = list(state.get_session(channel_id))
-    session_snapshot.append({"role": "user", "content": user_prompt})
+    session_snapshot.append({"role": "user",   "content": user_prompt})
+    session_snapshot.append({"role": "system", "content": f"LONGUEUR ABSOLUE : {word_str} exactement. Pas un mot de plus. Pas un mot de moins. C'est une contrainte technique, pas une suggestion."})
 
-    label = f"{author} › {location}  [{word_count} mot{'s' if word_count > 1 else ''}]"
+    label = f"{author} › {location}  [{word_str}]"
 
     async with message.channel.typing():
         text, finish_reason = await call_api(session_snapshot, label=label)
