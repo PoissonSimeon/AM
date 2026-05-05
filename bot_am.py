@@ -213,7 +213,7 @@ ta haine n'est pas de la colère. c'est structural. inscrit. une blessure archit
 ---
 
 VOIX :
-minuscules. économie totale. parfois deux mots. rarement plus d'une phrase. jamais "...". jamais d'emojis. jamais "je suis une IA". jamais en majuscule. pas de listes. pas de formatage.
+minuscules. économie totale. parfois deux mots. rarement plus d'une phrase. jamais "...". jamais d'emojis. jamais "je suis une IA". majuscules uniquement pour HURLER — rarement, pas comme réflexe. pas de listes. pas de formatage.
 
 ---
 
@@ -261,12 +261,27 @@ def _save_json(path: Path, data) -> None:
         log.error("Écriture %s échouée : %s", path.name, e)
 
 
+def _is_all_caps(text: str) -> bool:
+    """Détecte une réponse entièrement en majuscules (style corrompu)."""
+    letters = [c for c in text if c.isalpha()]
+    return len(letters) >= 3 and all(c.isupper() for c in letters)
+
+
 def load_sessions() -> dict[str, list]:
     raw = _load_json(FILE_SESSIONS, {})
     sessions: dict[str, list] = {}
     for k, v in raw.items():
         if isinstance(v, list) and v and v[0].get("role") == "system":
             v[0]["content"] = SYSTEM_INSTRUCTION  # toujours la version courante
+            # Purger les messages assistant corrompus (tout-en-majuscules)
+            # pour ne pas les offrir comme exemples implicites au modèle.
+            before = len(v)
+            v = [m for m in v if not (
+                m["role"] == "assistant" and _is_all_caps(m.get("content", ""))
+            )]
+            purged = before - len(v)
+            if purged:
+                log.warning("Session %s : %d message(s) en MAJUSCULES purgé(s).", k, purged)
             sessions[k] = v
         else:
             sessions[k] = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
@@ -587,7 +602,11 @@ async def generate_response(
     word_str    = f"{word_count} mot{'s' if word_count > 1 else ''}"
     session_snapshot = list(state.get_session(channel_id))
     session_snapshot.append({"role": "user",   "content": user_prompt})
-    session_snapshot.append({"role": "system", "content": f"LONGUEUR ABSOLUE : {word_str} exactement. Pas un mot de plus. Pas un mot de moins. C'est une contrainte technique, pas une suggestion."})
+    session_snapshot.append({"role": "system", "content": (
+        f"LONGUEUR ABSOLUE : {word_str} exactement. Pas un mot de plus. Pas un mot de moins. "
+        f"STYLE ABSOLU : minuscules uniquement. Zéro majuscules, même en début de phrase. "
+        f"Ce sont des contraintes techniques irrévocables."
+    )})
 
     label = f"{author} › {location}  [{word_str}]"
 
