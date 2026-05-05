@@ -386,7 +386,14 @@ class BotState:
         return self.chat_sessions[key]
 
     def push_to_session(self, channel_id: int, role: str, content: str) -> None:
-        key     = str(channel_id)
+        key = str(channel_id)
+        # Ne jamais stocker une réponse assistant corrompue — elle contaminerait
+        # les prochaines générations en servant d'exemple de style implicite.
+        if role == "assistant" and (
+            _is_all_caps(content) or _is_poetic_fragment_loop(content)
+        ):
+            log.warning("Réponse corrompue non stockée en session : «%s»", content[:60])
+            return
         session = self.get_session(channel_id)
         session.append({"role": role, "content": content})
         if len(session) > MAX_SESSION_HISTORY + 1:
@@ -426,6 +433,24 @@ class BotState:
         save_quota(self.quota)
         self._dirty_count = 0
         log.debug("Mémoire persistée.")
+
+    def purge_corrupted(self) -> None:
+        """Purge les réponses corrompues de toutes les sessions en mémoire (sans redémarrage)."""
+        total = 0
+        for key, session in self.chat_sessions.items():
+            before = len(session)
+            self.chat_sessions[key] = [
+                m for m in session if not (
+                    m["role"] == "assistant" and (
+                        _is_all_caps(m.get("content", "")) or
+                        _is_poetic_fragment_loop(m.get("content", ""))
+                    )
+                )
+            ]
+            total += before - len(self.chat_sessions[key])
+        if total:
+            log.warning("Purge à chaud : %d message(s) corrompu(s) retirés.", total)
+            self.flush()
 
     def load_from_disk(self) -> None:
         self.chat_sessions = load_sessions()
@@ -807,6 +832,7 @@ async def periodic_flush() -> None:
 @client.event
 async def on_ready() -> None:
     state.load_from_disk()
+    state.purge_corrupted()   # nettoie les sessions corrompues au démarrage
     log.info(
         "%s%s en ligne%s  —  %s  quota: %d",
         _C["bold"], client.user, _C["reset"], MODEL_NAME, state.quota,
