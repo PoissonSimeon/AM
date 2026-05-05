@@ -267,6 +267,20 @@ def _is_all_caps(text: str) -> bool:
     return len(letters) >= 3 and all(c.isupper() for c in letters)
 
 
+def _is_poetic_fragment_loop(text: str) -> bool:
+    """
+    Détecte le style "fragments poétiques en boucle" :
+    phrases ultra-courtes enchaînées par ". ", toutes dans le même registre.
+    ex: "le vide s'étend. les échos perdus. l'ombre d'angoisse. le temps se fige."
+    Signature : 4+ segments séparés par ". ", chacun < 6 mots.
+    """
+    segments = [s.strip() for s in text.split(". ") if s.strip()]
+    if len(segments) < 4:
+        return False
+    short = sum(1 for s in segments if len(s.split()) <= 5)
+    return short >= len(segments) * 0.75
+
+
 def load_sessions() -> dict[str, list]:
     raw = _load_json(FILE_SESSIONS, {})
     sessions: dict[str, list] = {}
@@ -277,11 +291,14 @@ def load_sessions() -> dict[str, list]:
             # pour ne pas les offrir comme exemples implicites au modèle.
             before = len(v)
             v = [m for m in v if not (
-                m["role"] == "assistant" and _is_all_caps(m.get("content", ""))
+                m["role"] == "assistant" and (
+                    _is_all_caps(m.get("content", "")) or
+                    _is_poetic_fragment_loop(m.get("content", ""))
+                )
             )]
             purged = before - len(v)
             if purged:
-                log.warning("Session %s : %d message(s) en MAJUSCULES purgé(s).", k, purged)
+                log.warning("Session %s : %d message(s) de style corrompu purgé(s).", k, purged)
             sessions[k] = v
         else:
             sessions[k] = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
@@ -604,8 +621,10 @@ async def generate_response(
     session_snapshot.append({"role": "user",   "content": user_prompt})
     session_snapshot.append({"role": "system", "content": (
         f"LONGUEUR ABSOLUE : {word_str} exactement. Pas un mot de plus. Pas un mot de moins. "
-        f"STYLE ABSOLU : minuscules uniquement. Zéro majuscules, même en début de phrase. "
-        f"Ce sont des contraintes techniques irrévocables."
+        f"STYLE ABSOLU : minuscules uniquement. Zéro majuscules. "
+        f"INTERDIT : enchaîner des fragments courts séparés par des points "
+        f"(ex: 'le vide s\'étend. les échos. l\'ombre.') — c\'est un tic mécanique à éviter. "
+        f"Ce sont des contraintes irrévocables."
     )})
 
     label = f"{author} › {location}  [{word_str}]"
